@@ -1,43 +1,25 @@
 # VulnFix POC — Agent + Tools API
 
-A proof-of-concept vulnerability remediation system. Two independent FastAPI
-services with a strict separation of concerns:
+A proof-of-concept vulnerability remediation system built as **two independent FastAPI services** with a strict separation of concerns:
 
-- **`tools-api/`** — the only component that performs mutations (git, npm,
-  filesystem). No LLM, no agent logic.
-- **`agent-api/`** — a LangGraph workflow that decides what to fix and
-  delegates every mutation to the Tools API over HTTP.
+- **`tools-api/`** — the only component allowed to perform *mutations* (git, npm, filesystem). No LLM, no agent logic.
+- **`agent-api/`** — a LangGraph workflow that decides what to fix and delegates every mutation to the Tools API over HTTP.
 
-The two services are designed to run in separate containers on separate
-networks, with only the agent allowed to call the tools. Docker packaging is
-out of scope for this POC.
+The services are intended to run in separate containers and/or networks, with only the Agent API able to call the Tools API. Docker packaging is out of scope for this POC.
 
 ## Security boundaries
 
-1. The agent never imports `subprocess`, never touches the filesystem, and
-   has no git/npm code. Every change to a repo is an HTTP call to the Tools
-   API. Grep the `agent-api/` tree for `subprocess` or `shutil` — nothing.
-2. The Tools API exposes a small, fixed set of endpoints. It does not accept
-   arbitrary commands. Package names and version specifiers are validated
-   with strict regexes at the model layer.
-3. All subprocess calls in the Tools API use `shell=False` with an explicit
-   argv list, so no user-supplied value ever reaches a shell.
-4. Workspaces are isolated to one directory per UUID under
-   `TOOLS_API_WORKSPACE_ROOT`. The workspace manager resolves every path
-   and rejects anything that doesn't live under the root (blocks `..` and
-   symlink escapes).
-5. The Tools API has no auth in this POC — it's assumed to run on a
-   trusted network reachable only by the Agent API. Production should
-   restore a shared secret or switch to mTLS.
-6. `npm audit fix --force` is **not** exposed. Force can introduce breaking
-   changes and is not appropriate for an automated agent.
-7. GitHub tokens used for pushing branches and opening PRs live only in
-   the Tools API environment. They're embedded into push URLs at runtime
-   and scrubbed from any error message surfaced to the agent.
+1. The agent never imports `subprocess`, never touches the filesystem, and has no git/npm code. Every change to a repo is an HTTP call to the Tools API.
+2. The Tools API exposes a small, fixed set of endpoints and does **not** accept arbitrary commands. Package names and version specifiers are validated with strict regexes at the model layer.
+3. All subprocess calls in the Tools API use `shell=False` with an explicit argv list, so no user-supplied value ever reaches a shell.
+4. Workspaces are isolated to one directory per UUID under `TOOLS_API_WORKSPACE_ROOT`. The workspace manager resolves every path and rejects anything outside the root (blocking `..` and symlink escapes).
+5. The Tools API has no auth in this POC — it’s assumed to run on a trusted network reachable only by the Agent API. Production should restore a shared secret or switch to mTLS.
+6. `npm audit fix --force` is **not** exposed. Force can introduce breaking changes and is not appropriate for an automated agent.
+7. GitHub tokens used for pushing branches and opening PRs live only in the Tools API environment. They are embedded into push URLs at runtime and scrubbed from any error message surfaced to the agent.
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────┐                  HTTP                   ┌─────────────────────┐
 │    Agent API        │ ─────────────────────────────────────► │    Tools API        │
 │  (LangGraph)        │                                         │                     │
@@ -60,7 +42,7 @@ out of scope for this POC.
 
 ## LangGraph workflow
 
-```
+```text
 START
   │
   ▼
@@ -91,12 +73,7 @@ summarize (LLM) ◄──────────────────┘
  END
 ```
 
-Workspace creation failures short-circuit to the summarizer so the caller
-always gets a report. LLM failures in the planner and summarizer fall back
-to deterministic heuristics, so the pipeline still works without an LLM
-key. `open_pr` skips cleanly if nothing was committed or if no
-`TOOLS_API_GITHUB_TOKEN` is configured; the failure is recorded in
-`errors` and the commit still lives locally in the (ephemeral) workspace.
+Workspace creation failures short-circuit to the summarizer so the caller always gets a report. LLM failures in the planner and summarizer fall back to deterministic heuristics, so the pipeline still works without an LLM key. `open_pr` skips cleanly if nothing was committed or if no `TOOLS_API_GITHUB_TOKEN` is configured; the failure is recorded in `errors` and the commit still lives locally in the (ephemeral) workspace.
 
 ## Running locally
 
@@ -107,15 +84,16 @@ key. `open_pr` skips cleanly if nothing was committed or if no
 - An LLM API key for real planning/summarization (otherwise heuristic fallbacks are used):
   - **OpenAI** (default): `OPENAI_API_KEY` — set `AGENT_API_LLM_PROVIDER=openai` (or leave unset)
   - **Anthropic**: `ANTHROPIC_API_KEY` — set `AGENT_API_LLM_PROVIDER=anthropic`
-  - **GitHub Models**: `GITHUB_TOKEN` (or `AGENT_API_GITHUB_MODELS_TOKEN`) — set `AGENT_API_LLM_PROVIDER=github` and `AGENT_API_LLM_MODEL` to a model on the GitHub Models catalog (e.g. `openai/gpt-5`)
-- A GitHub token to open pull requests (optional — without it, commits stay
-  local and `open_pr` is skipped). Needs `repo` scope (classic) or
-  `contents: write` + `pull_requests: write` (fine-grained) on the target
-  repo. Set as `TOOLS_API_GITHUB_TOKEN` on the Tools API host.
+  - **GitHub Models**: `GITHUB_TOKEN` (or `AGENT_API_GITHUB_MODELS_TOKEN`) — set `AGENT_API_LLM_PROVIDER=github` and `AGENT_API_LLM_MODEL` to a model from the GitHub Models catalog
+- A GitHub token to open pull requests (optional — without it, commits stay local and `open_pr` is skipped).
+  - Classic token: needs `repo` scope
+  - Fine-grained token: needs `contents: write` + `pull_requests: write` on the target repo
+  - Set as `TOOLS_API_GITHUB_TOKEN` on the Tools API host
 
 ### Tools API
 
-**Mac/Linux:**
+**Mac/Linux**
+
 ```bash
 cd tools-api
 python -m venv .venv && source .venv/bin/activate
@@ -128,7 +106,8 @@ export TOOLS_API_GITHUB_TOKEN="ghp_..."
 uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 ```
 
-**Windows (PowerShell):**
+**Windows (PowerShell)**
+
 ```powershell
 cd tools-api
 python -m venv .venv; .\.venv\Scripts\Activate.ps1
@@ -149,7 +128,8 @@ curl http://localhost:8001/health
 
 ### Agent API
 
-**Mac/Linux:**
+**Mac/Linux**
+
 ```bash
 cd agent-api
 python -m venv .venv && source .venv/bin/activate
@@ -171,7 +151,8 @@ export OPENAI_API_KEY="sk-proj-..."
 uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
 ```
 
-**Windows (PowerShell):**
+**Windows (PowerShell)**
+
 ```powershell
 cd agent-api
 python -m venv .venv; .\.venv\Scripts\Activate.ps1
@@ -195,7 +176,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
 
 ## Example request — single repo (`POST /remediate`)
 
-**Mac/Linux:**
+**Mac/Linux**
+
 ```bash
 curl -X POST http://localhost:8002/remediate \
   -H 'Content-Type: application/json' \
@@ -215,7 +197,8 @@ curl -X POST http://localhost:8002/remediate \
   }'
 ```
 
-**Windows (PowerShell):**
+**Windows (PowerShell)**
+
 ```powershell
 $body = @{
   repo_url = "https://github.com/TimCodes/vuln-test"
@@ -239,33 +222,31 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8002/remediate `
 
 ## Example request — CSV batch (`POST /remediate/batch`)
 
-Upload a CSV listing vulnerabilities across many repos; the agent groups
-rows by repo and runs one remediation per repo in parallel (bounded by
-`AGENT_API_BATCH_REMEDIATION_CONCURRENCY`, default `3`).
+Upload a CSV listing vulnerabilities across many repos; the agent groups rows by repo and runs one remediation per repo in parallel (bounded by `AGENT_API_BATCH_REMEDIATION_CONCURRENCY`, default `3`).
 
 Expected columns (case-insensitive; extras ignored):
 
-| Column         | Required | Notes                                                              |
-|----------------|----------|--------------------------------------------------------------------|
-| `Name/Package` | yes      | Package name; any `(Vulnerable versions: ...)` suffix is stripped. |
-| `Location`     | yes      | `<owner>/<repo>` slug. `(Vulnerable manifest path: ...)` stripped. |
-| `ID`           | no       | CVE id. `N/A` falls back to `Unique ID`.                           |
-| `Severity`     | no       | `Critical` / `High` / `Moderate` / `Low` / `Info`.                 |
-| `Description`  | no       | Truncated to `AGENT_API_CSV_DESCRIPTION_MAX_CHARS` (default 500).  |
-| `Unique ID`    | no       | Fallback identifier when `ID` is `N/A`.                            |
-| `Fixed Version`| no       | If present and not empty/`N/A`/`none`, bypasses the agent's fix inference. |
+| Column          | Required | Notes |
+|-----------------|----------|-------|
+| `Name/Package`  | yes      | Package name; any `(Vulnerable versions: ...)` suffix is stripped. |
+| `Location`      | yes      | `<owner>/<repo>` slug. `(Vulnerable manifest path: ...)` stripped. |
+| `ID`            | no       | CVE id. `N/A` falls back to `Unique ID`. |
+| `Severity`      | no       | `Critical` / `High` / `Moderate` / `Low` / `Info`. |
+| `Description`   | no       | Truncated to `AGENT_API_CSV_DESCRIPTION_MAX_CHARS` (default 500). |
+| `Unique ID`     | no       | Fallback identifier when `ID` is `N/A`. |
+| `Fixed Version` | no       | If present and not empty/`N/A`/`none`, bypasses the agent's fix inference. |
 
-Slug → git URL uses `AGENT_API_GITHUB_HOST` (default `https://github.com/`) —
-`acme-corp/foo` becomes `https://github.com/acme-corp/foo.git`. All batch
-runs target branch `main`.
+Slug → git URL uses `AGENT_API_GITHUB_HOST` (default `https://github.com/`) — `acme-corp/foo` becomes `https://github.com/acme-corp/foo.git`. All batch runs target branch `main`.
 
-**Mac/Linux:**
+**Mac/Linux**
+
 ```bash
 curl -X POST http://localhost:8002/remediate/batch \
   -F "file=@/path/to/vulnerabilities.csv"
 ```
 
-**Windows (PowerShell):**
+**Windows (PowerShell)**
+
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://localhost:8002/remediate/batch `
   -Form @{ file = Get-Item "C:\Users\you\Downloads\vulnerabilities.csv" }
@@ -300,18 +281,13 @@ Sample batch response (abridged):
 }
 ```
 
-Failures are per-repo: one blown-up clone or git push does not abort the
-rest of the batch. `parse_warnings` lists any rows dropped during CSV
-parsing (missing slug/package, validation errors, etc.).
+Failures are per-repo: one blown-up clone or git push does not abort the rest of the batch. `parse_warnings` lists any rows dropped during CSV parsing (missing slug/package, validation errors, etc.).
 
 ### Concurrency and batching
 
-The agent processes repos with a semaphore bounded by
-`AGENT_API_BATCH_REMEDIATION_CONCURRENCY` (default `3`). If the CSV
-contains more repos than the cap, all repos are still processed — extras
-queue and start as slots free:
+The agent processes repos with a semaphore bounded by `AGENT_API_BATCH_REMEDIATION_CONCURRENCY` (default `3`). If the CSV contains more repos than the cap, all repos are still processed — extras queue and start as slots free.
 
-```
+```text
 Time →   (example: 5 repos, cap = 3)
 
 Repo 1   [======== running ========]
@@ -321,15 +297,9 @@ Repo 4                             [=== queued → starts when slot frees ===]
 Repo 5                             [=== queued → starts when slot frees ===]
 ```
 
-The HTTP response only returns once **every** repo has finished, so a
-large CSV with slow clones will block for a while. The cap is not a
-limit on how many repos can be processed — it is a throttle to avoid
-overwhelming the Tools API with simultaneous workspace creation.
+The HTTP response returns only once **every** repo has finished, so a large CSV with slow clones will block for a while. The cap is a throttle to avoid overwhelming the Tools API with simultaneous workspace creation.
 
-The only hard ceiling is `TOOLS_API_MAX_WORKSPACES` on the Tools API
-side: each in-flight repo holds one workspace slot, so
-`AGENT_API_BATCH_REMEDIATION_CONCURRENCY` should be set no higher than
-that value.
+The only hard ceiling is `TOOLS_API_MAX_WORKSPACES` on the Tools API side: each in-flight repo holds one workspace slot, so `AGENT_API_BATCH_REMEDIATION_CONCURRENCY` should be set no higher than that value.
 
 Sample single-repo response (abridged):
 
@@ -338,7 +308,7 @@ Sample single-repo response (abridged):
   "repo_url": "...",
   "branch": "main",
   "workspace_id": "a1b2c3...",
-  "applied_fixes": [...],
+  "applied_fixes": [],
   "pr_url": "https://github.com/owner/repo/pull/42",
   "summary": "Fixed 3 vulnerabilities...",
   "errors": []
@@ -347,7 +317,7 @@ Sample single-repo response (abridged):
 
 ## Project layout
 
-```
+```text
 vulnfix-poc/
 ├── README.md
 ├── tools-api/
@@ -392,7 +362,7 @@ vulnfix-poc/
         ├── services/                        # orchestration between API, graph, clients
         │   ├── remediation_service.py       # single-repo: runs graph + cleanup + response
         │   └── batch_remediation_service.py # CSV → fan-out per repo (Semaphore-bounded)
-        ├── agents/                          # LLM-backed reasoning (singletons, lazy LLM)
+        ├── agents/                          # LLM-backed reasoning
         │   ├── planner_agent.py             # reported vulns + audit → FixAction[]
         │   └── summarizer_agent.py          # final state → human-readable report
         ├── graph/                           # LangGraph workflow
@@ -415,37 +385,21 @@ vulnfix-poc/
 
 ## What the POC intentionally does not do
 
-These are things a production version would need but that are out of scope
-here:
+A production version would need these, but they’re out of scope here:
 
-- **Docker**: the containerization and network isolation that would actually
-  enforce the agent→tools boundary at the infra layer.
-- **Push / PR creation**: the `commit` endpoint commits locally only. Push
-  and PR creation belong in a separate endpoint with credential handling
-  and a branching strategy.
-- **Persistence**: workspaces and graph state are in-memory. A real system
-  would use a durable LangGraph checkpointer and a workspace database.
-- **Human approval gate**: every successful plan is applied. Production
-  needs a hold-for-review step before commit/push.
-- **Authentication**: shared-secret header only. Production should use
-  mTLS between services and real auth on the public Agent API endpoint.
-- **Concurrency**: the Tools API serializes by workspace implicitly (one
-  workspace per request), but there's no cross-workspace rate limiting or
-  queueing.
-- **Observability**: stdout logging only. Production needs structured logs,
-  tracing, and metrics.
+- **Docker**: containerization and network isolation to enforce the agent→tools boundary at the infra layer.
+- **Push / PR creation**: push and PR creation should live in a separate endpoint with credential handling and a branching strategy.
+- **Persistence**: workspaces and graph state are in-memory; a real system would use a durable LangGraph checkpointer and a workspace database.
+- **Human approval gate**: every successful plan is applied; production needs a hold-for-review step before commit/push.
+- **Authentication**: production should use mTLS between services and real auth on the public Agent API endpoint.
+- **Concurrency**: there is no cross-workspace rate limiting or queueing.
+- **Observability**: stdout logging only; production needs structured logs, tracing, and metrics.
 
 ## Extending the POC
 
 A few natural next steps:
 
 - Add a `POST /workspaces/{id}/git/push` endpoint and a `create_pr` node.
-- Add a human-approval interrupt between `plan` and `execute_plan` using
-  LangGraph's interrupt mechanism. This matches the pattern already used
-  in the broader VulnFix system.
-- Store successful fix plans in a RAG index (one of the stated future
-  goals of the parent system) keyed by `(package, fixed_version)` so the
-  planner can short-circuit when it's seen a fix before.
+- Add a human-approval interrupt between `plan` and `execute_plan` using LangGraph’s interrupt mechanism.
+- Store successful fix plans in a RAG index keyed by `(package, fixed_version)` so the planner can short-circuit when it’s seen a fix before.
 - Replace the shared-secret auth with mTLS or OAuth client credentials.
-#   v u l n - a g e n t - f r e y a  
- 
