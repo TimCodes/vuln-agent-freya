@@ -32,16 +32,18 @@ class CommitChangesWorkflow:
         message: str,
         author_name: str,
         author_email: str,
+        allow_empty: bool = False,
     ) -> CommitResult:
         ws = self._manager.get(workspace_id)
         files = self._git.changed_files(ws.path)
-        if not files:
+        if not files and not allow_empty:
             raise NoChangesToCommitError("no changes to commit")
         sha = self._git.commit_all(
             repo_path=ws.path,
             message=message,
             author_name=author_name,
             author_email=author_email,
+            allow_empty=allow_empty,
         )
         return CommitResult(commit_sha=sha, files_changed=files)
 

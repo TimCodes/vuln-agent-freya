@@ -5,19 +5,34 @@ Graph shape:
     START
       │
       ▼
-  create_workspace
+    classify
       │
-      ▼  (skip downstream if no workspace)
-  initial_audit ──► plan ──► execute_plan ──► resync_manifest ──► final_audit ──► commit ──► open_pr ──► summarize ──► END
-                                                                                                             ▲
-  (short-circuit)                                                                                             │
-  create_workspace ── workspace_id is None ───────► summarize ────────────────────────────────────────────────┘
+      ├─ nothing to report ─────────────────────────────────► summarize
+      │
+      ▼
+    create_workspace
+      │
+      ├─ workspace creation failed ────────────────────────► summarize
+      │
+      ├─ no code vulns, only image / unclassified ────────► commit (empty)
+      │
+      ▼
+    initial_audit ──► plan ──► execute_plan ──► resync_manifest ──► final_audit ──► commit
+      │
+      ▼
+    open_pr ──► summarize
+
+`commit` handles two cases: a real tree diff when code fixes landed, and an
+empty commit (`--allow-empty`) when the PR is informational (image /
+unclassified rows only). `open_pr` runs whenever a commit exists.
 """
 from __future__ import annotations
 
 from langgraph.graph import END, StateGraph
 
+from ..schemas.models import VulnerabilityReport
 from .nodes import (
+    classify_node,
     commit_node,
     create_workspace_node,
     execute_plan_node,
@@ -31,15 +46,41 @@ from .nodes import (
 from .state import AgentState
 
 
+def _has_any_classified(reports: list[VulnerabilityReport]) -> bool:
+    return any(r.kind in ("code", "image", "unclassified") for r in reports)
+
+
+def _has_code_vulns(reports: list[VulnerabilityReport]) -> bool:
+    return any(r.kind == "code" for r in reports)
+
+
+def _after_classify(state: AgentState) -> str:
+    """Skip workspace provisioning entirely when there's nothing the
+    remediation pipeline can act on — no code to fix, no image/unclassified
+    rows to surface. Saves a clone."""
+    reports = state.get("reported_vulnerabilities", []) or []
+    return "create_workspace" if _has_any_classified(reports) else "summarize"
+
+
 def _after_create_workspace(state: AgentState) -> str:
-    """If workspace creation failed we skip straight to summarize so the
-    caller still gets a report explaining what went wrong."""
-    return "initial_audit" if state.get("workspace_id") else "summarize"
+    """Three routes after the clone:
+
+    * Clone failed → skip to summarize; caller still gets a structured error.
+    * Clone succeeded but there are no code vulns → skip the audit/plan/
+      execute chain and jump to commit (which will write an empty commit so
+      the informational PR has a target).
+    * Clone succeeded with code vulns → enter the full remediation chain.
+    """
+    if not state.get("workspace_id"):
+        return "summarize"
+    reports = state.get("reported_vulnerabilities", []) or []
+    return "initial_audit" if _has_code_vulns(reports) else "commit"
 
 
 def build_graph():
     graph = StateGraph(AgentState)
 
+    graph.add_node("classify", classify_node)
     graph.add_node("create_workspace", create_workspace_node)
     graph.add_node("initial_audit", initial_audit_node)
     graph.add_node("plan", plan_node)
@@ -50,11 +91,20 @@ def build_graph():
     graph.add_node("open_pr", open_pr_node)
     graph.add_node("summarize", summarize_node)
 
-    graph.set_entry_point("create_workspace")
+    graph.set_entry_point("classify")
+    graph.add_conditional_edges(
+        "classify",
+        _after_classify,
+        {"create_workspace": "create_workspace", "summarize": "summarize"},
+    )
     graph.add_conditional_edges(
         "create_workspace",
         _after_create_workspace,
-        {"initial_audit": "initial_audit", "summarize": "summarize"},
+        {
+            "initial_audit": "initial_audit",
+            "commit": "commit",
+            "summarize": "summarize",
+        },
     )
     graph.add_edge("initial_audit", "plan")
     graph.add_edge("plan", "execute_plan")

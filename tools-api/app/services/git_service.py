@@ -79,8 +79,19 @@ def push_branch(repo_path: Path, push_url: str, branch: str) -> None:
         )
 
 
-def commit_all(repo_path: Path, message: str, author_name: str, author_email: str) -> str:
-    """Stage all changes and create a commit. Returns commit SHA."""
+def commit_all(
+    repo_path: Path,
+    message: str,
+    author_name: str,
+    author_email: str,
+    allow_empty: bool = False,
+) -> str:
+    """Stage all changes and create a commit. Returns commit SHA.
+
+    ``allow_empty`` passes ``--allow-empty`` to git. Used by the agent for
+    informational PRs (image-only / unclassified vulnerabilities) where the
+    PR body carries the whole payload and the tree is intentionally unchanged.
+    """
     r1 = _run(["git", "add", "-A"], cwd=repo_path, timeout=settings.git_timeout_seconds)
     if r1.returncode != 0:
         raise GitError("git add failed", stderr=r1.stderr, exit_code=r1.returncode)
@@ -92,6 +103,8 @@ def commit_all(repo_path: Path, message: str, author_name: str, author_email: st
         "-c", f"user.email={author_email}",
         "commit", "-m", message,
     ]
+    if allow_empty:
+        commit_args.append("--allow-empty")
     r2 = _run(commit_args, cwd=repo_path, timeout=settings.git_timeout_seconds)
     if r2.returncode != 0:
         raise GitError(

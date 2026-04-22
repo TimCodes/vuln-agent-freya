@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 
 # ---------- incoming vulnerability report ----------
 
+VulnerabilityKind = Literal["code", "image", "unclassified"]
+
+
 class VulnerabilityReport(BaseModel):
     """A single vulnerability as reported by an upstream scanner.
 
@@ -14,7 +17,7 @@ class VulnerabilityReport(BaseModel):
     one or more of these in the remediation request.
     """
     id: str = Field(..., description="Identifier used by the reporter (e.g. CVE-2024-1234, GHSA-xxxx).")
-    package: str = Field(..., description="Affected npm package name.")
+    package: str = Field(..., description="Affected package name (npm for code, OS/base-image for image).")
     current_version: str | None = Field(default=None, description="Installed version if known.")
     fixed_version: str | None = Field(
         default=None,
@@ -22,6 +25,21 @@ class VulnerabilityReport(BaseModel):
     )
     severity: Literal["low", "moderate", "high", "critical", "info", "unknown"] = "unknown"
     description: str | None = None
+    manifest_path: str | None = Field(
+        default=None,
+        description=(
+            "Scanner-reported manifest that flagged this vuln (e.g. `package-lock.json`, "
+            "`Dockerfile`). Used by the classifier to decide code vs image."
+        ),
+    )
+    kind: VulnerabilityKind | None = Field(
+        default=None,
+        description=(
+            "Populated by the classifier node. `code` = remediable by the npm pipeline; "
+            "`image` = base-image / OS vuln requiring image rebuild; "
+            "`unclassified` = classifier could not decide with confidence."
+        ),
+    )
 
 
 class RemediateRequest(BaseModel):

@@ -10,10 +10,10 @@ Nodes never mutate the filesystem directly.
 """
 from __future__ import annotations
 
-from ..agents import planner_agent, summarizer_agent
+from ..agents import classifier_agent, planner_agent, summarizer_agent
 from ..clients import ToolsApiClient, ToolsApiError
 from ..core import get_logger, settings
-from ..schemas.models import AppliedFix, FixAction
+from ..schemas.models import AppliedFix, FixAction, VulnerabilityReport
 from ..utils import (
     build_report,
     commit_message,
@@ -26,6 +26,40 @@ from ..utils import (
 from .state import AgentState
 
 logger = get_logger("agent.graph")
+
+
+# ---------- helpers ----------
+
+def _filter_by_kind(
+    reports: list[VulnerabilityReport], kind: str,
+) -> list[VulnerabilityReport]:
+    return [r for r in reports if r.kind == kind]
+
+
+# ---------- node: classify ----------
+
+async def classify_node(state: AgentState) -> dict:
+    """Annotate each reported vulnerability with `kind` (code/image/unclassified).
+
+    Runs before workspace creation so downstream branching can short-circuit
+    the code-remediation path when there are no code vulns to fix.
+    """
+    reported = state.get("reported_vulnerabilities", []) or []
+    if not reported:
+        return {"reported_vulnerabilities": reported}
+
+    logger.info("node=classify reported=%d", len(reported))
+    try:
+        annotated = await classifier_agent.classify(reported)
+        return {"reported_vulnerabilities": annotated}
+    except Exception as e:
+        # Classifier failure is non-fatal: downstream treats "kind=None" rows
+        # as unclassified, so the PR still lands with a manual-triage section.
+        logger.exception("classify failed; defaulting rows to unclassified")
+        errs = list(state.get("errors", []))
+        errs.append(f"classify failed: {e}")
+        fallback = [r.model_copy(update={"kind": "unclassified"}) for r in reported]
+        return {"reported_vulnerabilities": fallback, "errors": errs}
 
 
 # ---------- node: create workspace ----------
@@ -81,7 +115,13 @@ async def plan_node(state: AgentState) -> dict:
     if not ws_id:
         return {"fix_plan": []}
 
-    reported = state.get("reported_vulnerabilities", []) or []
+    # Only feed code-classified rows to the planner. Image / unclassified
+    # rows are handled out-of-band by the PR body — pushing them through the
+    # planner would invite hallucinated `npm install` actions for things
+    # like `openssl`.
+    reported = _filter_by_kind(
+        state.get("reported_vulnerabilities", []) or [], "code",
+    )
     audit = state.get("initial_audit") or {}
     audit_total = summarize_audit(audit).get("total", 0)
 
@@ -344,18 +384,39 @@ async def final_audit_node(state: AgentState) -> dict:
 # ---------- node: commit ----------
 
 async def commit_node(state: AgentState) -> dict:
+    """Create the commit that the PR will point at.
+
+    Three cases:
+      1. At least one code fix succeeded → real commit of the tree diff.
+      2. No code fixes applied but image / unclassified rows exist → empty
+         commit. The PR body carries the entire informational payload, so
+         the reviewer still gets a durable artifact.
+      3. Nothing to report → no commit, no PR.
+    """
     ws_id = state.get("workspace_id")
     applied = state.get("applied_fixes", []) or []
-    if not ws_id or not any(a.success for a in applied):
+    reported = state.get("reported_vulnerabilities", []) or []
+    image_vulns = _filter_by_kind(reported, "image")
+    unclassified_vulns = _filter_by_kind(reported, "unclassified")
+
+    has_code_fix = any(a.success for a in applied)
+    has_non_code = bool(image_vulns or unclassified_vulns)
+
+    if not ws_id or (not has_code_fix and not has_non_code):
         return {"commit_sha": None}
 
     report = build_report(
         initial_audit=state.get("initial_audit"),
         final_audit=state.get("final_audit"),
         applied_fixes=applied,
-        reported=state.get("reported_vulnerabilities", []) or [],
+        reported=reported,
     )
-    message = commit_message(report)
+    message = commit_message(
+        report,
+        image_vulns=image_vulns,
+        unclassified_vulns=unclassified_vulns,
+    )
+    allow_empty = not has_code_fix  # code-fix runs always touch the lockfile
 
     async with ToolsApiClient() as client:
         try:
@@ -364,6 +425,7 @@ async def commit_node(state: AgentState) -> dict:
                 message=message,
                 author_name=settings.commit_author_name,
                 author_email=settings.commit_author_email,
+                allow_empty=allow_empty,
             )
             files = result.get("files_changed") or []
             return {
@@ -398,17 +460,34 @@ async def open_pr_node(state: AgentState) -> dict:
     base_branch = state.get("branch") or "main"
     head_branch = pr_head_branch(ws_id)
     applied = state.get("applied_fixes", []) or []
+    reported = state.get("reported_vulnerabilities", []) or []
+    image_vulns = _filter_by_kind(reported, "image")
+    unclassified_vulns = _filter_by_kind(reported, "unclassified")
+
     report = build_report(
         initial_audit=state.get("initial_audit"),
         final_audit=state.get("final_audit"),
         applied_fixes=applied,
-        reported=state.get("reported_vulnerabilities", []) or [],
+        reported=reported,
     )
+
     resolved_n = len(report.resolved_packages)
-    if resolved_n:
+    had_code_work = report.had_any_success or bool(report.package_changes)
+    # Title encodes intent so reviewers triage from the inbox without opening:
+    #   - code work landed  → "VulnFix: …"
+    #   - info-only (image / unclassified only) → "VulnFix [Info]: …"
+    if had_code_work and resolved_n:
         title = f"VulnFix: resolve {resolved_n} vulnerable package(s)"
-    else:
+    elif had_code_work:
         title = "VulnFix: automated vulnerability remediation"
+    else:
+        parts: list[str] = []
+        if image_vulns:
+            parts.append(f"{len(image_vulns)} image vuln(s)")
+        if unclassified_vulns:
+            parts.append(f"{len(unclassified_vulns)} unclassified vuln(s)")
+        detail = ", ".join(parts) if parts else "manual review"
+        title = f"VulnFix [Info]: {detail} — manual action required"
 
     committed_files = state.get("committed_files") or []
 
@@ -420,7 +499,12 @@ async def open_pr_node(state: AgentState) -> dict:
                 base_branch=base_branch,
                 head_branch=head_branch,
                 title=title,
-                body=pr_body(report, committed_files=committed_files),
+                body=pr_body(
+                    report,
+                    committed_files=committed_files,
+                    image_vulns=image_vulns,
+                    unclassified_vulns=unclassified_vulns,
+                ),
             )
             return {
                 "pr_url": result.get("url"),

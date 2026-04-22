@@ -1,12 +1,15 @@
 """Commit message, PR body, and PR branch-name builders.
 
-Presentation helpers consumed by graph nodes. Inputs are a
-`RemediationReport` (not raw `AppliedFix` lists) so the copy reflects what
-actually changed between audits rather than what the planner intended.
+Presentation helpers consumed by graph nodes. Code-remediation copy is
+derived from a `RemediationReport` so it reflects what actually changed
+between audits rather than what the planner intended. Image and
+unclassified rows are presented directly from their `VulnerabilityReport`
+inputs since no mutation or audit diff exists for them.
 """
 from __future__ import annotations
 
 from ..core.config import settings
+from ..schemas.models import VulnerabilityReport
 from .remediation_report import (
     STATUS_FAILED,
     STATUS_FIXED,
@@ -44,9 +47,28 @@ def _counts_line(counts: dict[str, int]) -> str:
     return ", ".join(parts) if parts else "none"
 
 
-def commit_message(report: RemediationReport) -> str:
-    """Short, truthful commit message derived from the reconciled report."""
-    lines = ["VulnFix: automated remediation", ""]
+def commit_message(
+    report: RemediationReport,
+    *,
+    image_vulns: list[VulnerabilityReport] | None = None,
+    unclassified_vulns: list[VulnerabilityReport] | None = None,
+) -> str:
+    """Short, truthful commit message derived from the reconciled report.
+
+    When ``report`` describes no code fixes but ``image_vulns`` /
+    ``unclassified_vulns`` are non-empty, emit an informational header —
+    this commit is intentionally empty and the payload is in the PR body.
+    """
+    image_vulns = image_vulns or []
+    unclassified_vulns = unclassified_vulns or []
+    had_code_work = report.had_any_success or bool(report.package_changes)
+
+    if not had_code_work and (image_vulns or unclassified_vulns):
+        header = "VulnFix: informational vulnerability report"
+    else:
+        header = "VulnFix: automated remediation"
+    lines = [header, ""]
+
     if report.resolved_packages:
         lines.append(
             f"Resolved {len(report.resolved_packages)} package(s): "
@@ -56,17 +78,31 @@ def commit_message(report: RemediationReport) -> str:
         lines.append(
             f"Remaining vulnerable: {', '.join(report.unresolved_packages)}."
         )
-    lines.append("")
-    lines.append(
-        f"Before: {report.initial_total} vuln(s) ({_counts_line(report.initial_counts)})."
-    )
-    lines.append(
-        f"After:  {report.final_total} vuln(s) ({_counts_line(report.final_counts)})."
-    )
+    if had_code_work:
+        lines.append("")
+        lines.append(
+            f"Before: {report.initial_total} vuln(s) ({_counts_line(report.initial_counts)})."
+        )
+        lines.append(
+            f"After:  {report.final_total} vuln(s) ({_counts_line(report.final_counts)})."
+        )
     if report.major_upgrades:
         majors = ", ".join(c.package for c in report.major_upgrades)
         lines.append("")
         lines.append(f"Includes major-version upgrade(s): {majors}.")
+
+    if image_vulns:
+        lines.append("")
+        lines.append(
+            f"Image vulnerabilities ({len(image_vulns)}): see PR body — "
+            f"rebuild affected base image(s) to remediate."
+        )
+    if unclassified_vulns:
+        lines.append("")
+        lines.append(
+            f"Unclassified vulnerabilities ({len(unclassified_vulns)}): see PR body — "
+            f"manual triage required."
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -190,6 +226,81 @@ def _checklist(
     return ["## Review checklist", "", *items]
 
 
+def _group_by_package(
+    vulns: list[VulnerabilityReport],
+) -> list[tuple[str, list[VulnerabilityReport]]]:
+    """Group vulns by package, preserving first-seen order."""
+    order: list[str] = []
+    buckets: dict[str, list[VulnerabilityReport]] = {}
+    for v in vulns:
+        if v.package not in buckets:
+            buckets[v.package] = []
+            order.append(v.package)
+        buckets[v.package].append(v)
+    return [(pkg, buckets[pkg]) for pkg in order]
+
+
+def _image_vulns_section(image_vulns: list[VulnerabilityReport]) -> list[str]:
+    if not image_vulns:
+        return []
+    lines = ["## Image vulnerabilities", ""]
+    lines.append(
+        "The following vulnerabilities live in base-image / OS packages and "
+        "cannot be remediated by this pipeline. **Manual action required**: "
+        "rebuild the affected container image against an updated base or "
+        "install the vendor-patched package at image-build time."
+    )
+    lines.append("")
+    lines.append(_table_row(["Package", "Severity", "CVE/GHSA", "Manifest", "Fix"]))
+    lines.append(_table_row(["---", "---", "---", "---", "---"]))
+    for pkg, items in _group_by_package(image_vulns):
+        severity = items[0].severity
+        ids = [v.id for v in items]
+        manifest = items[0].manifest_path or "—"
+        fixed = next((v.fixed_version for v in items if v.fixed_version), None)
+        fix_text = f"`{fixed}`" if fixed else "see advisory"
+        lines.append(_table_row([
+            f"`{pkg}`",
+            severity,
+            _format_cves(ids),
+            f"`{manifest}`" if manifest != "—" else "—",
+            fix_text,
+        ]))
+    return lines
+
+
+def _unclassified_vulns_section(
+    unclassified_vulns: list[VulnerabilityReport],
+) -> list[str]:
+    if not unclassified_vulns:
+        return []
+    lines = ["## Unclassified vulnerabilities — manual intervention required", ""]
+    lines.append(
+        "The classifier could not confidently determine whether these "
+        "vulnerabilities live in application code or in a container image. "
+        "**A human reviewer must triage each row** and remediate manually "
+        "(update a dependency, rebuild the image, or mark the row as a "
+        "false positive in the scanner)."
+    )
+    lines.append("")
+    lines.append(_table_row(["Package", "Severity", "CVE/GHSA", "Manifest", "Fix"]))
+    lines.append(_table_row(["---", "---", "---", "---", "---"]))
+    for pkg, items in _group_by_package(unclassified_vulns):
+        severity = items[0].severity
+        ids = [v.id for v in items]
+        manifest = items[0].manifest_path or "—"
+        fixed = next((v.fixed_version for v in items if v.fixed_version), None)
+        fix_text = f"`{fixed}`" if fixed else "—"
+        lines.append(_table_row([
+            f"`{pkg}`",
+            severity,
+            _format_cves(ids),
+            f"`{manifest}`" if manifest != "—" else "—",
+            fix_text,
+        ]))
+    return lines
+
+
 def _files_changed_section(committed_files: list[str] | None) -> list[str]:
     files = [f for f in (committed_files or []) if f]
     if not files:
@@ -200,14 +311,48 @@ def _files_changed_section(committed_files: list[str] | None) -> list[str]:
     return lines
 
 
+def _informational_checklist(
+    image_vulns: list[VulnerabilityReport],
+    unclassified_vulns: list[VulnerabilityReport],
+) -> list[str]:
+    """Checklist for PRs where nothing in the tree changed — only reviewer
+    follow-up tasks make sense."""
+    items: list[str] = []
+    if image_vulns:
+        items.append("- [ ] Identified the base image(s) flagged above")
+        items.append("- [ ] Rebuilt container image against a patched base / ran vendor update")
+    if unclassified_vulns:
+        items.append("- [ ] Triaged each unclassified row and chose a remediation path")
+    return ["## Review checklist", "", *items] if items else []
+
+
 def pr_body(
     report: RemediationReport,
     *,
     committed_files: list[str] | None = None,
+    image_vulns: list[VulnerabilityReport] | None = None,
+    unclassified_vulns: list[VulnerabilityReport] | None = None,
 ) -> str:
-    """Rich PR description derived from the reconciled remediation report."""
+    """Rich PR description derived from the reconciled remediation report
+    plus any image / unclassified vulnerabilities that require human
+    follow-up.
+
+    Code remediation status comes from the audit diff (authoritative). Image
+    and unclassified entries come straight from the scanner report because
+    there's no delta to compute — they're informational.
+    """
+    image_vulns = image_vulns or []
+    unclassified_vulns = unclassified_vulns or []
+    had_code_work = report.had_any_success or bool(report.package_changes)
+
     lines: list[str] = []
-    lines.append("Automated vulnerability remediation by VulnFix.")
+    if had_code_work:
+        lines.append("Automated vulnerability remediation by VulnFix.")
+    else:
+        lines.append(
+            "Informational vulnerability report by VulnFix — no code changes "
+            "were applied. See below for the items that need manual attention."
+        )
     lines.append("")
 
     # TL;DR
@@ -220,6 +365,13 @@ def pr_body(
         tldr_parts.append(f"**{unresolved_n}** still need(s) manual attention")
     if report.major_upgrades:
         tldr_parts.append(f"**{len(report.major_upgrades)}** major-version upgrade(s)")
+    if image_vulns:
+        tldr_parts.append(f"**{len(image_vulns)}** image vulnerability(ies) to rebuild")
+    if unclassified_vulns:
+        tldr_parts.append(
+            f"**{len(unclassified_vulns)}** unclassified vulnerability(ies) "
+            f"requiring manual triage"
+        )
     if not tldr_parts:
         tldr_parts.append("no remediation changes were required")
     lines.append("## Summary")
@@ -253,6 +405,18 @@ def pr_body(
         lines.extend(failed)
         lines.append("")
 
+    # Image vulnerabilities (informational)
+    image_section = _image_vulns_section(image_vulns)
+    if image_section:
+        lines.extend(image_section)
+        lines.append("")
+
+    # Unclassified vulnerabilities (manual triage)
+    unclass_section = _unclassified_vulns_section(unclassified_vulns)
+    if unclass_section:
+        lines.extend(unclass_section)
+        lines.append("")
+
     # Files actually committed (git status --porcelain from the commit step).
     files_section = _files_changed_section(committed_files)
     if files_section:
@@ -260,15 +424,25 @@ def pr_body(
         lines.append("")
 
     # Checklist
-    lines.extend(_checklist(report, committed_files))
+    if had_code_work:
+        lines.extend(_checklist(report, committed_files))
+    else:
+        lines.extend(_informational_checklist(image_vulns, unclassified_vulns))
     lines.append("")
 
     lines.append("---")
-    lines.append(
-        "_Generated by VulnFix. Counts come from `npm audit --json` runs "
-        "before and after remediation; status per package is derived from "
-        "the audit diff, not from planner intent._"
-    )
+    if had_code_work:
+        lines.append(
+            "_Generated by VulnFix. Counts come from `npm audit --json` runs "
+            "before and after remediation; status per package is derived from "
+            "the audit diff, not from planner intent._"
+        )
+    else:
+        lines.append(
+            "_Generated by VulnFix. This PR contains an empty commit so the "
+            "informational report has a reviewable target — no files were "
+            "modified in the tree._"
+        )
     return "\n".join(lines)
 
 

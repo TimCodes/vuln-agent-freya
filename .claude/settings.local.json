@@ -3,7 +3,9 @@
     "allow": [
       "Bash(python -c \"from app.main import app; print\\('routes:'\\); [print\\(' ', r.methods, r.path\\) for r in app.routes]\")",
       "Bash(./.venv/Scripts/python.exe -c \"from app.main import app; print\\('OK'\\); [print\\(' ', sorted\\(list\\(r.methods\\)\\) if hasattr\\(r,'methods'\\) else '-', r.path\\) for r in app.routes]\")",
-      "Bash(./.venv/Scripts/python.exe *)"
+      "Bash(./.venv/Scripts/python.exe *)",
+      "Bash(python -c ' *)",
+      "Bash(.venv/Scripts/python *)"
     ]
   }
 }

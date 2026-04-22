@@ -59,6 +59,13 @@ class CommitRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     author_name: str = Field(default="VulnFix Bot")
     author_email: str = Field(default="vulnfix-bot@example.com")
+    allow_empty: bool = Field(
+        default=False,
+        description=(
+            "Create the commit even when the working tree is unchanged. Used for "
+            "informational PRs whose payload is entirely in the PR body."
+        ),
+    )
 
 
 class CommitResult(BaseModel):

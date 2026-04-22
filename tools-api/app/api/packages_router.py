@@ -142,6 +142,7 @@ def commit_changes(workspace_id: str, body: CommitRequest) -> CommitResult:
             message=body.message,
             author_name=body.author_name,
             author_email=body.author_email,
+            allow_empty=body.allow_empty,
         )
     except WorkspaceError as e:
         logger.exception("workspace lookup failed for commit: workspace_id=%s", workspace_id)

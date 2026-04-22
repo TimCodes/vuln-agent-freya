@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from typing import Iterable
 
 from ..core import settings
@@ -67,6 +68,26 @@ def _strip_parenthetical(value: str) -> str:
     return value[:idx].strip() if idx != -1 else value
 
 
+_MANIFEST_PATH_RE = re.compile(r"Vulnerable manifest path:\s*([^)]+)", re.IGNORECASE)
+
+
+def _extract_manifest_path(value: str) -> str | None:
+    """Pull `package-lock.json` out of `acme/foo (Vulnerable manifest path: package-lock.json)`.
+
+    Scanner output is the only place we learn what file flagged the vuln, and
+    that's the strongest signal for code-vs-image classification. Without it,
+    the classifier has to fall back to package-name heuristics, which are
+    fragile for cross-ecosystem names like `openssl` or `libxml2`.
+    """
+    if not value:
+        return None
+    match = _MANIFEST_PATH_RE.search(value)
+    if not match:
+        return None
+    path = match.group(1).strip().strip(",").strip()
+    return path or None
+
+
 def _map_severity(value: str | None) -> str:
     v = _clean(value).lower()
     return _SEVERITY_MAP.get(v, "unknown")
@@ -113,7 +134,9 @@ def parse_vulnerability_csv(
 
     for row_num, row in enumerate(reader, start=2):  # row 1 is the header
         total += 1
-        slug = _strip_parenthetical(row.get(cols["location"], ""))
+        raw_location = row.get(cols["location"], "")
+        slug = _strip_parenthetical(raw_location)
+        manifest_path = _extract_manifest_path(raw_location)
         package = _strip_parenthetical(row.get(cols["package"], ""))
         if not slug or not package:
             skipped += 1
@@ -141,6 +164,7 @@ def parse_vulnerability_csv(
                 fixed_version=fixed,
                 severity=_map_severity(row.get(cols["severity"], "") if "severity" in cols else ""),
                 description=description or None,
+                manifest_path=manifest_path,
             )
         except Exception as e:
             skipped += 1

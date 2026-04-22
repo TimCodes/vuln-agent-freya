@@ -126,7 +126,12 @@ class ToolsApiClient:
         return {"rewritten": rewritten, "overrides_added": overrides_added}
 
     async def commit(
-        self, workspace_id: str, message: str, author_name: str, author_email: str
+        self,
+        workspace_id: str,
+        message: str,
+        author_name: str,
+        author_email: str,
+        allow_empty: bool = False,
     ) -> dict:
         return await self._request(
             "POST",
@@ -135,6 +140,7 @@ class ToolsApiClient:
                 "message": message,
                 "author_name": author_name,
                 "author_email": author_email,
+                "allow_empty": allow_empty,
             },
         )
 
